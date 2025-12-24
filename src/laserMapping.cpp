@@ -64,7 +64,7 @@
 #define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
-
+#define IMU_PRE              1
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
 double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN], s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
@@ -139,6 +139,26 @@ geometry_msgs::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+#if IMU_PRE
+// --- IMU-based high-rate propagation state (enabled only after EKF has updated once)
+Eigen::Quaterniond latest_Q = Eigen::Quaterniond::Identity();
+Eigen::Vector3d    latest_P = Eigen::Vector3d::Zero();
+Eigen::Vector3d    latest_V = Eigen::Vector3d::Zero();
+Eigen::Vector3d    latest_Ba = Eigen::Vector3d::Zero();
+Eigen::Vector3d    latest_Bg = Eigen::Vector3d::Zero();
+Eigen::Vector3d    latest_acc_0 = Eigen::Vector3d::Zero();
+Eigen::Vector3d    latest_gyr_0 = Eigen::Vector3d::Zero();
+// Eigen::Vector3d    g_vec(0, 0, 9.81);
+Eigen::Vector3d    g_vec = Eigen::Vector3d::Zero();  // IMU acceleration is already de-gravitized
+double             latest_time = -1.0;
+bool               latest_init = false;
+
+ros::Publisher     pubOdomPropagated;           // /Odometry_propagated
+double             prop_rate_hz = 100.0;        // 可调
+double             prop_pub_interval = 1.0/100.0;
+ros::Time          last_prop_pub;
+bool               publish_propagated_state = true;
+#endif
 
 void SigHandle(int sig)
 {
@@ -333,6 +353,69 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
     sig_buffer.notify_all();
 }
 
+#if IMU_PRE
+static inline Eigen::Quaterniond deltaQ(const Eigen::Vector3d &dtheta) {
+    Eigen::Quaterniond dq(1.0, 0.5*dtheta.x(), 0.5*dtheta.y(), 0.5*dtheta.z());
+    return dq.normalized();
+}
+
+void fastPredictIMU(double t, const Eigen::Vector3d& acc, const Eigen::Vector3d& gyr)
+{
+    if (!latest_init) return;
+    double dt = t - latest_time;
+    if (dt <= 0.0 || dt > 0.05) {  // 防止异常大步长
+        latest_time  = t;
+        latest_acc_0 = acc;
+        latest_gyr_0 = gyr;
+        return;
+    }
+    latest_time = t;
+
+    Eigen::Vector3d un_acc_0 = latest_Q * (latest_acc_0 - latest_Ba) - g_vec;
+    // Eigen::Vector3d un_acc_0 = latest_Q * (latest_acc_0 - latest_Ba);
+    Eigen::Vector3d un_gyr   = 0.5 * (latest_gyr_0 + gyr) - latest_Bg;
+
+    latest_Q = latest_Q * deltaQ(un_gyr * dt);
+    latest_Q.normalize();
+
+    Eigen::Vector3d un_acc_1 = latest_Q * (acc - latest_Ba) - g_vec;
+    // Eigen::Vector3d un_acc_1 = latest_Q * (latest_acc_0 - latest_Ba);
+    Eigen::Vector3d un_acc   = 0.5 * (un_acc_0 + un_acc_1);
+
+    latest_P += dt * latest_V + 0.5 * dt * dt * un_acc;
+    latest_V += dt * un_acc;
+
+    latest_acc_0 = acc;
+    latest_gyr_0 = gyr;
+}
+
+void publishPropagatedOdom(const ros::Time& stamp, const geometry_msgs::Vector3& ang_vel)
+{
+    if (!publish_propagated_state || !latest_init) return;
+
+    nav_msgs::Odometry odom;
+    odom.header.stamp    = stamp;
+    odom.header.frame_id = "camera_init";
+    odom.child_frame_id  = "body";
+
+    odom.pose.pose.position.x = latest_P.x();
+    odom.pose.pose.position.y = latest_P.y();
+    odom.pose.pose.position.z = latest_P.z();
+    odom.pose.pose.orientation.w = latest_Q.w();
+    odom.pose.pose.orientation.x = latest_Q.x();
+    odom.pose.pose.orientation.y = latest_Q.y();
+    odom.pose.pose.orientation.z = latest_Q.z();
+
+    odom.twist.twist.linear.x = latest_V.x();
+    odom.twist.twist.linear.y = latest_V.y();
+    odom.twist.twist.linear.z = latest_V.z();
+
+    odom.twist.twist.angular = ang_vel;
+
+    pubOdomPropagated.publish(odom);
+}
+#endif
+
 void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in) 
 {
     publish_count ++;
@@ -361,6 +444,25 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
     imu_buffer.push_back(msg);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
+#if IMU_PRE
+    if (latest_init) {
+        Eigen::Vector3d acc(msg->linear_acceleration.x,
+                            msg->linear_acceleration.y,
+                            msg->linear_acceleration.z);
+        Eigen::Vector3d gyr(msg->angular_velocity.x,
+                            msg->angular_velocity.y,
+                            msg->angular_velocity.z);
+
+        fastPredictIMU(msg->header.stamp.toSec(), acc, gyr);
+
+        if (publish_propagated_state &&
+            (msg->header.stamp - last_prop_pub).toSec() >= prop_pub_interval)
+        {
+            last_prop_pub = msg->header.stamp;
+            publishPropagatedOdom(msg->header.stamp,msg->angular_velocity);
+        }
+    }
+#endif
 }
 
 double lidar_mean_scantime = 0.0;
@@ -583,7 +685,7 @@ void set_posestamp(T & out)
     out.pose.orientation.y = geoQuat.y;
     out.pose.orientation.z = geoQuat.z;
     out.pose.orientation.w = geoQuat.w;
-    
+
 }
 
 void publish_odometry(const ros::Publisher & pubOdomAftMapped)
@@ -858,6 +960,9 @@ int main(int argc, char** argv)
             ("/Odometry", 100000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
+
+    pubOdomPropagated = nh.advertise<nav_msgs::Odometry>("/Odometry_propagated", 200000);
+    last_prop_pub = ros::Time(0);
 //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
     ros::Rate rate(5000);
@@ -970,6 +1075,35 @@ int main(int argc, char** argv)
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped);
+
+            if (!Measures.imu.empty()) {
+                const auto& last_imu = Measures.imu.back();
+                Eigen::Vector3d acc(last_imu->linear_acceleration.x,
+                                    last_imu->linear_acceleration.y,
+                                    last_imu->linear_acceleration.z);
+                Eigen::Vector3d gyr(last_imu->angular_velocity.x,
+                                    last_imu->angular_velocity.y,
+                                    last_imu->angular_velocity.z);
+
+                latest_Q  = state_point.rot;
+                latest_P  = state_point.pos;
+                latest_V  = state_point.vel;
+                latest_Ba = state_point.ba;
+                latest_Bg = state_point.bg;
+
+                // 若 EKF 的重力是可估计量，保持一致；否则保留默认 (0,0,9.81)
+                // g_vec = Eigen::Vector3d(state_point.grav[0],
+                //                         state_point.grav[1],
+                //                         state_point.grav[2]);
+                g_vec.setZero(); 
+
+                latest_time  = last_imu->header.stamp.toSec();
+                latest_acc_0 = acc;
+                latest_gyr_0 = gyr;
+
+                latest_init  = true;   // 只有 EKF 校正后才置 true
+            }
+
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
